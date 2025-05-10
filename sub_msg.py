@@ -13,9 +13,9 @@ try:
             print(f"Received message: {message['data']}")
             #print(f"Decoded message: {message['data'].decode('utf-8')}")
 
-    for message in pubsub.get_message():
-        if message and message['type'] == 'message':
-            print(f"GET message: {message['data']}")
-            print(f"Decoded GET message: {message['data'].decode('utf-8')}")
+    message = pubsub.get_message()
+    if message and message['type'] == 'message':
+        print(f"GET message: {message['data']}")
+        print(f"Decoded GET message: {message['data'].decode('utf-8')}")
 except KeyboardInterrupt:
     print("\nStopped listening.")
