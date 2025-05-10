@@ -5,7 +5,7 @@ import questionary
 import database
 from redis_utils import redis_manager
 import time
-from typing import Dict, List
+from typing import Dict
 
 console = Console()
 
@@ -17,6 +17,18 @@ class Game1:
         self.conn = database.get_connection()
         self.redis = redis_manager
 
+    def all_terms_approved(self) -> bool:
+        """Check if all terms have been approved by Team 2"""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM game1_terms WHERE team2_status != 'OK'")
+            return cur.fetchone()[0] == 0
+
+    def get_term_data(self) -> Dict:
+        """Fetch current term data from database"""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT term, team1_value, unit, team2_status FROM game1_terms")
+            return {row[0]: {'value': row[1], 'unit': row[2], 'status': row[3]} for row in cur.fetchall()}
+
     def run(self):
         if self.team == "Team 1":
             self.team1_flow()
@@ -24,77 +36,96 @@ class Game1:
             self.team2_flow()
 
     def team1_flow(self):
-        # Initial input collection
+        # Initial term input
         for term in self.terms:
             self.update_term(term)
 
-        # Show initial outputs
-        self.display_outputs()
+        # Subscribe to Team 2 updates immediately
+        pubsub = self.redis.subscribe_to_channel("team2_updates")
 
-        # Edit loop
-        while True:
-            if questionary.confirm("Do you want to edit any term?", default=False).ask():
-                term = questionary.select(
-                    "Select term to edit:",
-                    choices=self.terms
-                ).ask()
-                self.update_term(term)
-                self.redis.publish_update("team1_update", f"{term}_updated")
+        try:
+            while not self.all_terms_approved():
                 self.display_outputs()
-            else:
-                break
 
-        # Wait for all terms to be approved
-        while not self.all_terms_approved():
-            console.print("[yellow]Waiting for Team 2 to approve all terms...[/yellow]")
-            time.sleep(3)
-            self.display_outputs()
+                # Check for Team 2 updates
+                message = pubsub.get_message()
+                if message and message['type'] == 'message':
+                    term = message['data'].decode('utf-8')
+                    console.print(f"\n[bold green]Team 2 updated status for {term}[/bold green]")
+                    continue
 
-        console.print("[green]All terms have been approved![/green]")
+                # Edit option
+                if questionary.confirm("Do you want to edit any term?", default=False).ask():
+                    term = questionary.select("Select term to edit:", choices=self.terms).ask()
+                    self.update_term(term)
+                    self.redis.publish_update("team1_updates", term)
+                    console.print(f"\n[bold yellow]Updated {term} - Team 2 notified[/bold yellow]")
+
+                time.sleep(0.5)  # Prevent high CPU usage
+        finally:
+            pubsub.unsubscribe("team2_updates")
+
+        console.print("\n[green]All terms approved![/green]")
         self.display_final_output()
 
     def team2_flow(self):
-        # FIXED: Changed from subscribe() to subscribe_to_channel()
-        pubsub = self.redis.subscribe_to_channel("team1_update")
+        # Subscribe to Team 1 updates immediately
+        pubsub = self.redis.subscribe_to_channel("team1_updates")
 
         try:
-            # Initial display
-            self.display_outputs()
-
             while not self.all_terms_approved():
-                # Check for updates
-                message = pubsub.get_message(timeout=1)
-                if message and message['type'] == 'message':
-                    self.display_outputs()
+                self.display_outputs()
 
+                # Check for Team 1 updates
+                message = pubsub.get_message()
+                if message and message['type'] == 'message':
+                    term = message['data'].decode('utf-8')
+                    console.print(f"\n[bold yellow]Team 1 updated {term} - status reset to TBD[/bold yellow]")
+                    continue
+
+                # Approval interface
                 term = questionary.select(
                     "Select term to approve/reject:",
-                    choices=self.terms + ["Exit"]
+                    choices=self.terms + ["Exit"],
+                    default="Exit"
                 ).ask()
 
                 if term == "Exit":
-                    if Confirm.ask("Do you want to exit? The game will continue when all terms are approved."):
+                    if Confirm.ask("Exit now? You can return later."):
                         break
                     continue
 
-                self.update_status(term)
-                self.redis.publish_update("team2_update", f"{term}_status_changed")
-                self.display_outputs()
+                status = questionary.select(
+                    f"Status for {term}:",
+                    choices=[
+                        {"name": "Approve (OK)", "value": "OK"},
+                        {"name": "Reject (TBD)", "value": "TBD"}
+                    ]
+                ).ask()
 
-            if self.all_terms_approved():
-                console.print("[green]You have approved all terms![/green]")
-                self.display_final_output()
+                with self.conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE game1_terms
+                        SET team2_status = %s
+                        WHERE term = %s
+                    """, (status, term))
+                    self.conn.commit()
 
+                self.redis.publish_update("team2_updates", term)
+                console.print(f"\n[bold green]{term} status updated to {status}[/bold green]")
+
+                time.sleep(0.5)  # Prevent high CPU usage
         finally:
-            # FIXED: Changed from unsubscribe() to unsubscribe() method on pubsub
-            pubsub.unsubscribe("team1_update")
+            pubsub.unsubscribe("team1_updates")
+
+        if self.all_terms_approved():
+            console.print("\n[green]All terms approved![/green]")
+            self.display_final_output()
 
     def update_term(self, term: str):
+        """Update a term's value and reset status to TBD"""
         with self.conn.cursor() as cur:
-            cur.execute(
-                "SELECT unit FROM game1_terms WHERE term = %s",
-                (term,)
-            )
+            cur.execute("SELECT unit FROM game1_terms WHERE term = %s", (term,))
             unit = cur.fetchone()[0]
 
         value = questionary.text(
@@ -110,80 +141,19 @@ class Game1:
             """, (float(value), term))
             self.conn.commit()
 
-    def update_status(self, term: str):
-        status = questionary.select(
-            f"Approve or reject {term}?",
-            choices=[
-                "Approve (OK)",
-                "Reject (TBD)"
-            ]
-        ).ask()
-
-        status_code = "OK" if status.startswith("Approve") else "TBD"
-
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                UPDATE game1_terms
-                SET team2_status = %s
-                WHERE term = %s
-            """, (status_code, term))
-            self.conn.commit()
-
-    def get_term_data(self) -> Dict:
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT term, team1_value, unit, team2_status FROM game1_terms")
-            return {row[0]: {'value': row[1], 'unit': row[2], 'status': row[3]} for row in cur.fetchall()}
-
-    def all_terms_approved(self) -> bool:
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM game1_terms WHERE team2_status != 'OK'")
-            return cur.fetchone()[0] == 0
-
-    def calculate_valuation(self, term_data: Dict) -> str:
-        if all(term['status'] == 'OK' for term in term_data.values()):
-            ebitda = term_data['EBITDA']['value']
-            multiple = term_data['Multiple']['value']
-            factor = term_data['Factor Score']['value']
-            return f"${ebitda * multiple * factor:,.2f}"
-        return "Not yet agreed by Team 2"
-
     def display_outputs(self):
+        """Display current terms and statuses"""
+        console.clear()
         term_data = self.get_term_data()
 
-        if self.team == "Team 1":
-            self.display_team1_output(term_data)
-        else:
-            self.display_team2_output(term_data)
-
-    def display_team1_output(self, term_data: Dict):
-        table = Table(title="Your Outputs (Team 1)")
+        table = Table(title=f"{self.team} View")
         table.add_column("Term", style="cyan")
-        table.add_column("Your Value", style="magenta")
-        table.add_column("Team 2 Status", style="green")
-
-        for term, data in term_data.items():
-            status = "[green]OK[/green]" if data['status'] == 'OK' else "[red]TBD[/red]"
-            table.add_row(
-                term,
-                f"{data['value']} {data['unit']}",
-                status
-            )
-
-        console.print(table)
-
-        # Show valuation
-        valuation = self.calculate_valuation(term_data)
-        console.print(f"\n[bold]Valuation:[/bold] {valuation}\n")
-
-    def display_team2_output(self, term_data: Dict):
-        table = Table(title="Your Outputs (Team 2)")
-        table.add_column("Term", style="cyan")
-        table.add_column("Team 1 Value", style="magenta")
+        table.add_column("Value", style="magenta")
         table.add_column("Unit")
-        table.add_column("Your Status", style="green")
+        table.add_column("Status", justify="right")
 
         for term, data in term_data.items():
-            status = "[green]OK[/green]" if data['status'] == 'OK' else "[red]TBD[/red]"
+            status = '[green]OK[/green]' if data['status'] == 'OK' else '[red]TBD[/red]'
             table.add_row(
                 term,
                 str(data['value']),
@@ -193,25 +163,50 @@ class Game1:
 
         console.print(table)
 
-        # Show valuation
-        valuation = self.calculate_valuation(term_data)
-        console.print(f"\n[bold]Valuation:[/bold] {valuation}\n")
+        if self.team == "Team 1":
+            if not self.all_terms_approved():
+                console.print("\n[blue]Waiting for Team 2 approvals...[/blue]")
+            else:
+                console.print("\n[green]All terms approved![/green]")
+        else:
+            console.print("\n[dim]Select term to approve/reject or 'Exit' to pause[/dim]")
 
     def display_final_output(self):
+        """Show final approved valuation"""
+        console.clear()
         term_data = self.get_term_data()
-        table = Table(title="Final Valuation")
-        table.add_column("Term")
-        table.add_column("Value")
+
+        table = Table(title="🎉 Final Approved Valuation 🎉")
+        table.add_column("Term", style="cyan")
+        table.add_column("Value", style="magenta")
         table.add_column("Unit")
+        table.add_column("Status", style="green")
 
         for term, data in term_data.items():
             table.add_row(
                 term,
                 str(data['value']),
-                data['unit']
+                data['unit'],
+                "OK"
             )
 
         valuation = self.calculate_valuation(term_data)
-        table.add_row("Final Valuation", valuation, "")
+        table.add_row("", "", "", "")
+        table.add_row("[bold]Valuation[/bold]", f"[green]{valuation}[/green]", "", "")
 
         console.print(table)
+        console.print("\n[green]Deal successfully negotiated![/green]")
+
+    def calculate_valuation(self, term_data: Dict) -> str:
+        """Calculate final valuation based on approved terms"""
+        if not self.all_terms_approved():
+            return "Pending approvals"
+
+        ebitda = term_data['EBITDA']['value']
+        rate = term_data['Interest Rate']['value']
+        multiple = term_data['Multiple']['value']
+        factor = term_data['Factor Score']['value']
+
+        # Sample valuation calculation - adjust based on your actual formula
+        valuation = ebitda * multiple * factor / (1 + rate)
+        return f"${valuation:,.2f}"
