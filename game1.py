@@ -1,10 +1,10 @@
 from rich.console import Console
 from rich.table import Table
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm
 import questionary
 import database
 from redis_utils import redis_manager
-import time
+import threading
 from typing import Dict
 
 console = Console()
@@ -16,6 +16,8 @@ class Game1:
         self.terms = ["EBITDA", "Interest Rate", "Multiple", "Factor Score"]
         self.conn = database.get_connection()
         self.redis = redis_manager
+        self.update_event = threading.Event()
+        self.shutdown_event = threading.Event()
 
     def all_terms_approved(self) -> bool:
         """Check if all terms have been approved by Team 2"""
@@ -40,18 +42,19 @@ class Game1:
         for term in self.terms:
             self.update_term(term)
 
-        # Subscribe to Team 2 updates immediately
+        # Start listening for Team 2 updates in background
         pubsub = self.redis.subscribe_to_channel("team2_updates")
+        listener_thread = threading.Thread(target=self.listen_for_updates, args=(pubsub, "Team 2"))
+        listener_thread.daemon = True
+        listener_thread.start()
 
         try:
-            while not self.all_terms_approved():
+            while not self.all_terms_approved() and not self.shutdown_event.is_set():
                 self.display_outputs()
 
-                # Check for Team 2 updates
-                message = pubsub.get_message()
-                if message and message['type'] == 'message':
-                    term = message['data'].decode('utf-8')
-                    console.print(f"\n[bold green]Team 2 updated status for {term}[/bold green]")
+                if self.update_event.is_set():
+                    self.update_event.clear()
+                    console.print("\n[bold green]Update received! Refreshing view...[/bold green]")
                     continue
 
                 # Edit option
@@ -60,39 +63,42 @@ class Game1:
                     self.update_term(term)
                     self.redis.publish_update("team1_updates", term)
                     console.print(f"\n[bold yellow]Updated {term} - Team 2 notified[/bold yellow]")
-
-                time.sleep(0.5)  # Prevent high CPU usage
         finally:
+            self.shutdown_event.set()
             pubsub.unsubscribe("team2_updates")
+            listener_thread.join(timeout=1)
 
-        console.print("\n[green]All terms approved![/green]")
-        self.display_final_output()
+        if self.all_terms_approved():
+            console.print("\n[green]All terms approved![/green]")
+            self.display_final_output()
 
     def team2_flow(self):
-        # Subscribe to Team 1 updates immediately
+        # Start listening for Team 1 updates in background
         pubsub = self.redis.subscribe_to_channel("team1_updates")
+        listener_thread = threading.Thread(target=self.listen_for_updates, args=(pubsub, "Team 1"))
+        listener_thread.daemon = True
+        listener_thread.start()
 
         try:
-            while not self.all_terms_approved():
+            while not self.all_terms_approved() and not self.shutdown_event.is_set():
                 self.display_outputs()
 
-                # Check for Team 1 updates
-                message = pubsub.get_message()
-                if message and message['type'] == 'message':
-                    term = message['data'].decode('utf-8')
-                    console.print(f"\n[bold yellow]Team 1 updated {term} - status reset to TBD[/bold yellow]")
+                if self.update_event.is_set():
+                    self.update_event.clear()
                     continue
 
                 # Approval interface
                 term = questionary.select(
                     "Select term to approve/reject:",
-                    choices=self.terms + ["Exit"],
-                    default="Exit"
+                    choices=self.terms + ["Refresh", "Exit"],
+                    default="Refresh"
                 ).ask()
 
                 if term == "Exit":
-                    if Confirm.ask("Exit now? You can return later."):
+                    if questionary.confirm("Exit now? You can return later.", default=False).ask():
                         break
+                    continue
+                elif term == "Refresh":
                     continue
 
                 status = questionary.select(
@@ -113,14 +119,27 @@ class Game1:
 
                 self.redis.publish_update("team2_updates", term)
                 console.print(f"\n[bold green]{term} status updated to {status}[/bold green]")
-
-                time.sleep(0.5)  # Prevent high CPU usage
         finally:
+            self.shutdown_event.set()
             pubsub.unsubscribe("team1_updates")
+            listener_thread.join(timeout=1)
 
         if self.all_terms_approved():
             console.print("\n[green]All terms approved![/green]")
             self.display_final_output()
+
+    def listen_for_updates(self, pubsub, team_name: str):
+        """Listen for updates in background thread"""
+        try:
+            for message in pubsub.listen():
+                if self.shutdown_event.is_set():
+                    break
+                if message['type'] == 'message':
+                    term = message['data']  # Using data directly without decode
+                    console.print(f"\n[bold]Update from {team_name}: {term}[/bold]")
+                    self.update_event.set()
+        except Exception as e:
+            console.print(f"[red]Error in listener thread: {e}[/red]")
 
     def update_term(self, term: str):
         """Update a term's value and reset status to TBD"""
@@ -207,6 +226,6 @@ class Game1:
         multiple = term_data['Multiple']['value']
         factor = term_data['Factor Score']['value']
 
-        # Sample valuation calculation - adjust based on your actual formula
+        # Sample valuation calculation
         valuation = ebitda * multiple * factor / (1 + rate)
         return f"${valuation:,.2f}"

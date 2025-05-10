@@ -13,7 +13,8 @@ class RedisManager:
                 host=os.getenv("REDIS_HOST", "localhost"),
                 port=int(os.getenv("REDIS_PORT", 6379)),
                 password=os.getenv("REDIS_PASSWORD", None),
-                socket_connect_timeout=3
+                socket_connect_timeout=3,
+                decode_responses = True
             )
             self.r.ping()  # Test connection
             self.redis_connected = True
