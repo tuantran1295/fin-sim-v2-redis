@@ -95,7 +95,7 @@ class Game2:
         """Listen for updates from the other team"""
         try:
             for message in pubsub.listen():
-                console.print(f"Received Message: {message}")
+                # console.print(f"Received Message: {message}")
 
                 if self.should_exit.is_set():
                     break
