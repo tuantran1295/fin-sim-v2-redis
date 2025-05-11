@@ -25,6 +25,19 @@ class Game2:
         self.team_1_done_input = False
         self.team_2_done_input = False
 
+    def has_team1_pricing_done(self) -> bool:
+        """Check if all terms have been approved by Team 2"""
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM game2_pricing WHERE price > 0 AND shares > 0")
+            return cur.fetchone()[0] == 3
+
+    def team2_bidding(self):
+        self.console.print("\nTeam 1 ready - enter your bids:", style="bold green")
+        self.input_bids()
+        self.redis.publish_update("team2_completed", "done")
+        self.display_results()
+        self.team_2_done_input = True
+
     def run(self):
         if self.team == "Team 1":
             self.team1_flow()
@@ -75,6 +88,9 @@ class Game2:
             listener_thread.daemon = True
             listener_thread.start()
 
+            if self.has_team1_pricing_done():
+                self.team2_bidding()
+
             try:
                 while not self.team_1_done_input:
                     # if self.needs_refresh.is_set():
@@ -102,11 +118,7 @@ class Game2:
 
                 if message['type'] == 'message':
                     if message['channel'] == "team1_completed" and message['data']:
-                        self.console.print("\nTeam 1 ready - enter your bids:", style="bold green")
-                        self.input_bids()
-                        self.redis.publish_update("team2_completed", "done")
-                        self.display_results()
-                        self.team_2_done_input = True
+                        self.team2_bidding()
                     elif message['channel'] == "team2_completed" and message['data']:
                         self.team_2_done_input = True
                         self.needs_refresh.set()
