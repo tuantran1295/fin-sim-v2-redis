@@ -145,7 +145,7 @@ class Game1:
                 listener_thread.join(timeout=1)
                 if self.all_terms_approved():
                     console.print("\n[green]All terms approved![/green]")
-                    self.display_final_output()
+                    self.display_final_output(pubsub)
 
 
     def listen_for_updates(self, pubsub, team_name: str):
@@ -159,7 +159,7 @@ class Game1:
                     term = message['data']
                     if self.all_terms_approved():
                         with self.display_lock:
-                            self.display_final_output()
+                            self.display_final_output(pubsub)
                         break
                     else:
                         with self.display_lock:
@@ -191,6 +191,7 @@ class Game1:
                 WHERE term = %s
             """, (float(value), term))
             self.conn.commit()
+            self.redis.publish_update("team1_updates", term)
 
     def display_outputs(self):
         """Display current terms and statuses"""
@@ -216,9 +217,10 @@ class Game1:
 
         if not self.all_terms_approved():
             if self.team == "Team 2":
-                console.print("\n[i]Select terms to approve/reject[/i]")
+                console.print("\n[i]Press Enter to select terms to approve/reject[/i]")
 
-    def display_final_output(self):
+    def display_final_output(self, pubsub):
+        if pubsub: pubsub.unsubscribe()
         """Show final approved valuation"""
         console.clear()
         term_data = self.get_term_data()
