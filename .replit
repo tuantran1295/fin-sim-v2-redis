@@ -1,7 +1,15 @@
+run = """
 mkdir -p ~/.postgresql && initdb -D ~/.postgresql
 pg_ctl -D ~/.postgresql start
-python database.py
 export DATABASE_URL="postgresql://$(whoami)@localhost/simulation_games"
 npm install -g redis-server
 redis-server --port 6379 --daemonize yes
 python main.py
+"""
+
+[nix]
+deps = [
+    "postgresql",
+    "nodePackages.redis-server",
+    "python39Packages.psycopg2"
+]
