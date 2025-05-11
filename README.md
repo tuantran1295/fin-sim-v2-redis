@@ -47,7 +47,7 @@ simulation-games/
 
 1. **Initialize the database** (first time only):
    ```bash
-   python -c "import database; database.init_db()"
+   python database.py
    ```
 
 2. **Run the application**:
